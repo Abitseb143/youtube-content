@@ -1,5 +1,6 @@
 # Multi-purpose image — used by both `api` and `worker` Railway services.
-# `api` service uses the default CMD (start-api.sh runs migrations + uvicorn).
+# Built from build context = apps/api/ (set Service Root Directory to apps/api).
+# `api` service uses default CMD (start-api.sh runs migrations + uvicorn).
 # `worker` service overrides CMD to: arq faceless.worker.WorkerSettings
 
 FROM python:3.12-slim
@@ -11,8 +12,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Build deps for asyncpg / cryptography wheels (most have prebuilt wheels for slim,
-# but build-essential makes fallback compilation work if needed).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
@@ -20,16 +19,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-COPY apps/api/pyproject.toml ./
-COPY apps/api/src ./src
+COPY pyproject.toml ./
+COPY src ./src
 RUN pip install --upgrade pip && pip install -e .
 
-# Copy migrations and config
-COPY apps/api/alembic.ini ./
-COPY apps/api/alembic ./alembic
+# Copy migrations + config
+COPY alembic.ini ./
+COPY alembic ./alembic
 
 # Copy startup script
-COPY apps/api/scripts/start-api.sh ./scripts/start-api.sh
+COPY scripts/start-api.sh ./scripts/start-api.sh
 RUN chmod +x ./scripts/start-api.sh
 
 EXPOSE 8000
