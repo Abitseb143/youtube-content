@@ -125,8 +125,11 @@ User ──< Channel ──< ContentSeries ──< Job ──< Scene ──< Ass
 - `image_prompt`, `narration_text`
 - `image_asset_id`, `clip_asset_id`, `audio_asset_id` (fk assets, nullable until generated)
 - `kling_external_job_id`
-- `state` (enum: `pending`, `image_done`, `clip_done`, `audio_done`, `done`, `failed`)
-- `attempt`, `last_error`
+- `visual_state` (enum: `pending`, `image_done`, `clip_done`, `failed`) — tracks the visual sub-path (image → Kling clip)
+- `audio_state` (enum: `pending`, `done`, `failed`) — tracks the TTS sub-path, runs independently of visual_state
+- `image_attempt`, `clip_attempt`, `audio_attempt` (per-sub-task retry counters)
+- `last_error` (jsonb — captures which sub-task last failed and why)
+- A scene is **done** when `visual_state = 'clip_done'` AND `audio_state = 'done'`. A scene is terminally **failed** when either state is `failed`.
 
 **`assets`** — opaque file references in R2
 - `id`, `job_id` (fk)
@@ -219,31 +222,47 @@ created
 
 A user-rejected `ready_for_review` can spawn a new Job (regenerate) at fresh credit cost.
 
-### Per-scene sub-state machine
+### Per-scene sub-state machine (two parallel paths)
 
-Scenes fan out in parallel within Kling per-account concurrency limits.
+Each scene has two independent sub-paths that progress concurrently. Both must complete before the scene is "done."
 
+**Visual path (`visual_state`):**
 ```
-pending → image_done → clip_pending → clip_done → audio_done → done
-                          │
-                          └─ kling_polling (loop with back-off)
+pending → image_done → (clip_pending) → clip_done
+                            │
+                            └─ Kling polling (loop with back-off)
+[any step] → failed
 ```
 
-Job advances to `composing` only when all scenes are `done` or any is terminally `failed`.
+**Audio path (`audio_state`):**
+```
+pending → done
+        → failed
+```
+
+The audio path depends only on `narration_text` and is enqueued *at the same time* as image generation (immediately after `scene_plan` completes). It does not block on or depend on the visual path.
+
+**Scene completion:** scene is "done" when `visual_state = 'clip_done'` AND `audio_state = 'done'`. Scene is terminally "failed" when either state is `failed` (after exhausting that sub-task's retry budget).
+
+**Job advancement:** job advances to `composing` only when all scenes are simultaneously done. Any scene reaching `failed` triggers job-level failure → full credit refund.
 
 ### Workers and queues (arq, Redis-backed)
 
-| Queue | Concurrency | Stage handlers |
+All job-stage queues run inside a single arq worker process. Recurring "cron-like" jobs use arq's built-in `cron_jobs` feature (no separate scheduler service needed).
+
+| Queue / cron | Trigger | Stage handlers |
 |---|---|---|
-| `q.script` | high | `generate_script`, `generate_scene_plan` |
-| `q.image` | medium | `generate_scene_image` |
-| `q.clip_submit` | low (rate-limited) | `submit_kling_job` |
-| `q.clip_poll` | recurring (every 30s) | `poll_kling_jobs` (batched) |
-| `q.audio` | medium | `generate_scene_audio` |
-| `q.compose` | low (CPU/disk-bound) | `compose_final_video` |
-| `q.upload` | low | `upload_to_youtube` |
-| `q.analytics` | recurring | `pull_analytics` (batched by next_pull time) |
-| `q.scheduler` | recurring (cron-like) | `enqueue_due_series_jobs`, `auto_approve_expired`, `recompute_learning_profiles`, `reconcile_credits` |
+| `q.script` | enqueued on `Job` creation | `generate_script` → on success enqueues `generate_scene_plan` |
+| `q.scene_plan` | enqueued by `generate_script` | `generate_scene_plan` → on success enqueues per-scene `q.image` and `q.audio` for every scene in parallel |
+| `q.image` | enqueued per-scene by `generate_scene_plan` | `generate_scene_image` → on success enqueues `q.clip_submit` |
+| `q.clip_submit` | enqueued per-scene after image done | `submit_kling_job` (concurrency-bounded by `KLING_MAX_INFLIGHT`) |
+| `q.audio` | enqueued per-scene by `generate_scene_plan` (in parallel with `q.image`) | `generate_scene_audio` (TTS + alignment) |
+| `q.compose` | enqueued by the **scene-completion checker** (last sub-task to finish enqueues compose iff all scenes are done) | `compose_final_video` |
+| `q.upload` | enqueued by approval action | `upload_to_youtube` |
+| **arq cron: poll-kling** | every 30s | `poll_kling_jobs` (batched query of all in-flight scenes) |
+| **arq cron: scheduler** | every 60s | `enqueue_due_series_jobs`, `auto_approve_expired` |
+| **arq cron: analytics** | every 15 min | `pull_analytics` (batched by next_pull time) |
+| **arq cron: nightly** | once daily | `recompute_learning_profiles`, `reconcile_credits` |
 
 ### Critical orchestration rules
 
@@ -251,7 +270,7 @@ Job advances to `composing` only when all scenes are `done` or any is terminally
 2. **Idempotency:** every stage handler checks "already done" before doing work. Crash recovery is automatic.
 3. **Credit debits are atomic and pre-flight.** Serializable transaction that checks balance and debits before submitting to expensive providers (Kling).
 4. **No cross-stage state in worker memory.** Read from Postgres at start, persist before exit.
-5. **Retries with exponential back-off**, capped per stage. Retry counts on `scenes.attempt` / `jobs.current_stage_attempt`.
+5. **Retries with exponential back-off**, capped per stage. Retry counts on `scenes.image_attempt` / `scenes.clip_attempt` / `scenes.audio_attempt` / `jobs.current_stage_attempt`.
 6. **Kling polling is decoupled from submission.** A separate batched poller queries many in-flight jobs per call. Reduces API pressure dramatically.
 
 ### Failure handling & refund policy
@@ -611,13 +630,12 @@ faceless-yt/
 └── README.md
 ```
 
-### Backend (apps/api) — one Python package, multiple entrypoints
+### Backend (apps/api) — one Python package, two entrypoints
 
 ```
 apps/api/src/faceless/
 ├── main.py            # FastAPI app entry
-├── worker.py          # arq worker entry
-├── scheduler.py       # cron-tick entry
+├── worker.py          # arq worker entry (queues + arq cron jobs)
 ├── api/               # HTTP layer (thin)
 │   ├── deps.py        # auth, db session, settings, ownership
 │   ├── errors.py
@@ -722,13 +740,14 @@ LOG_LEVEL=info
 
 ### Deployment (Railway)
 
-Four Railway services from one repo, each with its own start command:
+Three Railway services from one repo, each with its own start command:
 - `api` — `uvicorn faceless.main:app --host 0.0.0.0 --port $PORT`
-- `worker` — `arq faceless.worker.WorkerSettings`
-- `scheduler` — Railway native cron, runs internal scheduler/analytics endpoints on schedule
+- `worker` — `arq faceless.worker.WorkerSettings` (handles both pipeline queues and arq cron jobs: kling polling, scheduler, analytics, nightly recompute)
 - `web` — `next start -p $PORT`
 
 Postgres and Redis as Railway managed addons; private networking between services.
+
+The `/internal/*` endpoints (Section 6) remain as backstops for ops/manual invocation but are not on a recurring trigger — arq cron handles the recurring schedule from inside the worker process.
 
 ---
 
